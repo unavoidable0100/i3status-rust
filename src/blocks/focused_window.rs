@@ -1,14 +1,15 @@
 //! Currently focused window
 //!
 //! This block displays the title and/or the active marks (when used with `sway`/`i3`) of the currently
-//! focused window. Supported WMs are: `sway`, `i3` and `river`. See `driver` option for more info.
+//! focused window. Supported WMs are: `sway`, `i3` and most wlroots-based compositors. See `driver`
+//! option for more info.
 //!
 //! # Configuration
 //!
 //! Key | Values | Default
 //! ----|--------|--------
 //! `format` | A string to customise the output of this block. See below for available placeholders. | <code>" $title.str(0,21) &vert;"</code>
-//! `driver` | Which driver to use. Available values: `sway_ipc` - for `i3` and `sway`, `ristate` - for `river` (note that [`ristate`](https://gitlab.com/snakedye/ristate) binary must be in the `PATH`), `auto` - try to automatically guess which driver to use. | `"auto"`
+//! `driver` | Which driver to use. Available values: `sway_ipc` - for `i3` and `sway`, `wlr_toplevel_management` - for Wayland compositors that implement [wlr-foreign-toplevel-management-unstable-v1](https://gitlab.freedesktop.org/wlroots/wlr-protocols/-/blob/master/unstable/wlr-foreign-toplevel-management-unstable-v1.xml), `auto` - try to automatically guess which driver to use. | `"auto"`
 //!
 //! Placeholder     | Value                                                                 | Type | Unit
 //! ----------------|-----------------------------------------------------------------------|------|-----
@@ -36,11 +37,16 @@
 use super::prelude::*;
 use swayipc_async::{Connection, Event, EventStream, EventType, WindowChange, WorkspaceChange};
 
-use std::process::Stdio;
-use tokio::{
-    io::{BufReader, Lines},
-    process::{ChildStdout, Command},
-};
+mod wl_protocol {
+    use wayrs_client;
+    use wayrs_client::protocol::*;
+    wayrs_scanner::generate!("wl-protocol/wlr-foreign-toplevel-management-unstable-v1.xml");
+}
+use wayrs_client::event_queue::EventQueue;
+use wayrs_client::global::GlobalsExt;
+use wayrs_client::protocol::*;
+use wayrs_client::proxy::{Dispatch, Dispatcher};
+use wl_protocol::*;
 
 #[derive(Deserialize, Debug, SmartDefault)]
 #[serde(default)]
@@ -55,7 +61,7 @@ enum Driver {
     #[default]
     Auto,
     SwayIpc,
-    Ristate,
+    WlrToplevelManagement,
 }
 
 pub async fn run(config: Config, mut api: CommonApi) -> Result<()> {
@@ -64,10 +70,10 @@ pub async fn run(config: Config, mut api: CommonApi) -> Result<()> {
     let mut backend: Box<dyn Backend> = match config.driver {
         Driver::Auto => match SwayIpc::new().await {
             Ok(swayipc) => Box::new(swayipc),
-            Err(_) => Box::new(Ristate::new()?),
+            Err(_) => Box::new(WlrToplevelManagement::new().await?),
         },
         Driver::SwayIpc => Box::new(SwayIpc::new().await?),
-        Driver::Ristate => Box::new(Ristate::new()?),
+        Driver::WlrToplevelManagement => Box::new(WlrToplevelManagement::new().await?),
     };
 
     loop {
@@ -170,49 +176,136 @@ impl Backend for SwayIpc {
     }
 }
 
-struct Ristate {
-    stream: Lines<BufReader<ChildStdout>>,
+struct WlrToplevelManagement {
+    event_queue: EventQueue<WlrToplevelManagementState>,
+    state: WlrToplevelManagementState,
 }
 
-impl Ristate {
-    fn new() -> Result<Self> {
-        let mut ristate = Command::new("ristate")
-            .arg("-w")
-            .stdout(Stdio::piped())
-            .spawn()
-            .error("failed to run ristate")?;
-        let stream = BufReader::new(ristate.stdout.take().unwrap()).lines();
+#[derive(Default)]
+struct WlrToplevelManagementState {
+    new_title: Option<String>,
+    toplevels: HashMap<zwlr_foreign_toplevel_handle_v1::ZwlrForeignToplevelHandleV1, WlrToplevel>,
+    active: Option<zwlr_foreign_toplevel_handle_v1::ZwlrForeignToplevelHandleV1>,
+}
 
-        tokio::spawn(async move {
-            let _ = ristate.wait().await;
-        });
+#[derive(Default)]
+struct WlrToplevel {
+    title: Option<String>,
+    active: bool,
+}
 
-        Ok(Self { stream })
+impl WlrToplevelManagement {
+    async fn new() -> Result<Self> {
+        let (globals, mut event_queue) = EventQueue::async_init().await.error("wayland error")?;
+        event_queue.set_callback::<zwlr_foreign_toplevel_handle_v1::ZwlrForeignToplevelHandleV1>();
+        let _: zwlr_foreign_toplevel_manager_v1::ZwlrForeignToplevelManagerV1 = globals
+            .bind(&mut event_queue, 1..=3)
+            .error("unsupported compositor")?;
+        event_queue
+            .connection()
+            .async_flush()
+            .await
+            .error("wayland error")?;
+        Ok(Self {
+            event_queue,
+            state: default(),
+        })
     }
 }
 
 #[async_trait]
-impl Backend for Ristate {
+impl Backend for WlrToplevelManagement {
     async fn get_info(&mut self) -> Result<Info> {
-        #[derive(Deserialize, Debug)]
-        struct RistateOuput {
-            title: String,
+        loop {
+            self.event_queue
+                .async_recv_events()
+                .await
+                .error("wayland error")?;
+
+            self.event_queue.dispatch_events(&mut self.state)?;
+
+            self.event_queue
+                .connection()
+                .async_flush()
+                .await
+                .error("wayland error")?;
+
+            if let Some(title) = self.state.new_title.take() {
+                return Ok(Info {
+                    title,
+                    marks: default(),
+                });
+            }
         }
+    }
+}
 
-        let line = self
-            .stream
-            .next_line()
-            .await
-            .error("ristate exited unexpectedly")?
-            .error("error reading line from ristate")?;
+impl Dispatcher for WlrToplevelManagementState {
+    type Error = Error;
+}
 
-        let title = serde_json::from_str::<RistateOuput>(&line)
-            .error("ristate produced invalid json")?
-            .title;
+impl Dispatch<wl_registry::WlRegistry> for WlrToplevelManagementState {}
 
-        Ok(Info {
-            title,
-            marks: default(),
-        })
+impl Dispatch<zwlr_foreign_toplevel_manager_v1::ZwlrForeignToplevelManagerV1>
+    for WlrToplevelManagementState
+{
+    fn try_event(
+        &mut self,
+        _: &mut EventQueue<Self>,
+        _: zwlr_foreign_toplevel_manager_v1::ZwlrForeignToplevelManagerV1,
+        event: zwlr_foreign_toplevel_manager_v1::Event,
+    ) -> Result<()> {
+        match event {
+            zwlr_foreign_toplevel_manager_v1::Event::Toplevel(toplevel) => {
+                self.toplevels.insert(toplevel, default());
+                Ok(())
+            }
+            zwlr_foreign_toplevel_manager_v1::Event::Finished => {
+                Err(Error::new("unexpected 'finished' event"))
+            }
+        }
+    }
+}
+
+impl Dispatch<zwlr_foreign_toplevel_handle_v1::ZwlrForeignToplevelHandleV1>
+    for WlrToplevelManagementState
+{
+    fn event(
+        &mut self,
+        event_queue: &mut EventQueue<Self>,
+        wlr_toplevel: zwlr_foreign_toplevel_handle_v1::ZwlrForeignToplevelHandleV1,
+        event: zwlr_foreign_toplevel_handle_v1::Event,
+    ) {
+        let toplevel = self.toplevels.get_mut(&wlr_toplevel).unwrap();
+        match event {
+            zwlr_foreign_toplevel_handle_v1::Event::Title(title) => {
+                toplevel.title = Some(String::from_utf8_lossy(title.as_bytes()).into());
+            }
+            zwlr_foreign_toplevel_handle_v1::Event::State(state) => {
+                toplevel.active = state
+                    .chunks_exact(4)
+                    .map(|b| u32::from_ne_bytes(b.try_into().unwrap()))
+                    .any(|s| s == zwlr_foreign_toplevel_handle_v1::State::Activated as u32);
+            }
+            zwlr_foreign_toplevel_handle_v1::Event::Closed => {
+                if self.active == Some(wlr_toplevel) {
+                    self.active = None;
+                    self.new_title = Some(default());
+                }
+
+                wlr_toplevel.destroy(event_queue);
+                self.toplevels.remove(&wlr_toplevel);
+            }
+            zwlr_foreign_toplevel_handle_v1::Event::Done => {
+                if toplevel.active {
+                    self.active = Some(wlr_toplevel);
+                    self.new_title = Some(toplevel.title.clone().unwrap_or_default());
+                } else if self.active == Some(wlr_toplevel) {
+                    self.active = None;
+                    self.new_title = Some(default());
+                }
+            }
+            _ => (),
+        }
     }
 }

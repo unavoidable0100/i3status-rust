@@ -92,6 +92,15 @@ features = ["futures-v0_3"]
 version = "0.11"
 features = ["json"]
 
+[dependencies.wayrs-client]
+git = "https://github.com/MaxVerevkin/wayrs"
+rev = "6191de0ddef8ab7f6f927f5d80f05744f73d5c50"
+features = ["tokio"]
+
+[dependencies.wayrs-scanner]
+git = "https://github.com/MaxVerevkin/wayrs"
+rev = "6191de0ddef8ab7f6f927f5d80f05744f73d5c50"
+
 # Test async code
 [dev-dependencies]
 tokio-test = "*"
