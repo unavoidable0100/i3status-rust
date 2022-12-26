@@ -2257,7 +2257,8 @@ checksum = "1c38c045535d93ec4f0b4defec448e4291638ee608530863b1e2ba115d4fff7f"
 [[package]]
 name = "wayrs-client"
 version = "0.1.0"
-source = "git+https://github.com/MaxVerevkin/wayrs?rev=6191de0ddef8ab7f6f927f5d80f05744f73d5c50#6191de0ddef8ab7f6f927f5d80f05744f73d5c50"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0e583271b9e118b8fc78bfc70d0456840433336fd37f82b749803729ca18ce9a"
 dependencies = [
  "nix 0.26.1",
  "thiserror",
@@ -2267,8 +2268,9 @@ dependencies = [
 
 [[package]]
 name = "wayrs-scanner"
-version = "0.1.0"
-source = "git+https://github.com/MaxVerevkin/wayrs?rev=6191de0ddef8ab7f6f927f5d80f05744f73d5c50#6191de0ddef8ab7f6f927f5d80f05744f73d5c50"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "13358215f62f552f1a4ca04c1b1b6fb2a3529fff78b98460aa2f13b6a8948491"
 dependencies = [
  "convert_case",
  "proc-macro2",

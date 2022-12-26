@@ -6,14 +6,14 @@ mod wl_protocol {
     use wayrs_client::protocol::*;
     wayrs_scanner::generate!("wl-protocol/wlr-foreign-toplevel-management-unstable-v1.xml");
 }
-use wayrs_client::event_queue::EventQueue;
+use wayrs_client::connection::Connection;
 use wayrs_client::global::GlobalsExt;
 use wayrs_client::protocol::*;
 use wayrs_client::proxy::{Dispatch, Dispatcher};
 use wl_protocol::*;
 
 pub(super) struct WlrToplevelManagement {
-    event_queue: EventQueue<State>,
+    conn: Connection<State>,
     state: State,
 }
 
@@ -32,18 +32,22 @@ struct Toplevel {
 
 impl WlrToplevelManagement {
     pub(super) async fn new() -> Result<Self> {
-        let (globals, mut event_queue) = EventQueue::async_init().await.error("wayland error")?;
-        event_queue.set_callback::<zwlr_foreign_toplevel_handle_v1::ZwlrForeignToplevelHandleV1>();
-        let _: zwlr_foreign_toplevel_manager_v1::ZwlrForeignToplevelManagerV1 = globals
-            .bind(&mut event_queue, 1..=3)
-            .error("unsupported compositor")?;
-        event_queue
-            .connection()
-            .async_flush()
+        let mut conn = Connection::connect().error("failed to connect to wayland")?;
+        let globals = conn
+            .async_collect_initial_globals()
             .await
             .error("wayland error")?;
+
+        conn.set_callback::<zwlr_foreign_toplevel_handle_v1::ZwlrForeignToplevelHandleV1>();
+
+        let _: zwlr_foreign_toplevel_manager_v1::ZwlrForeignToplevelManagerV1 = globals
+            .bind(&mut conn, 1..=3)
+            .error("unsupported compositor")?;
+
+        conn.async_flush().await.error("wayland error")?;
+
         Ok(Self {
-            event_queue,
+            conn,
             state: default(),
         })
     }
@@ -53,18 +57,9 @@ impl WlrToplevelManagement {
 impl Backend for WlrToplevelManagement {
     async fn get_info(&mut self) -> Result<Info> {
         loop {
-            self.event_queue
-                .async_recv_events()
-                .await
-                .error("wayland error")?;
-
-            self.event_queue.dispatch_events(&mut self.state)?;
-
-            self.event_queue
-                .connection()
-                .async_flush()
-                .await
-                .error("wayland error")?;
+            self.conn.async_recv_events().await.error("wayland error")?;
+            self.conn.dispatch_events(&mut self.state)?;
+            self.conn.async_flush().await.error("wayland error")?;
 
             if let Some(title) = self.state.new_title.take() {
                 return Ok(Info {
@@ -85,7 +80,7 @@ impl Dispatch<wl_registry::WlRegistry> for State {}
 impl Dispatch<zwlr_foreign_toplevel_manager_v1::ZwlrForeignToplevelManagerV1> for State {
     fn try_event(
         &mut self,
-        _: &mut EventQueue<Self>,
+        _: &mut Connection<Self>,
         _: zwlr_foreign_toplevel_manager_v1::ZwlrForeignToplevelManagerV1,
         event: zwlr_foreign_toplevel_manager_v1::Event,
     ) -> Result<()> {
@@ -104,7 +99,7 @@ impl Dispatch<zwlr_foreign_toplevel_manager_v1::ZwlrForeignToplevelManagerV1> fo
 impl Dispatch<zwlr_foreign_toplevel_handle_v1::ZwlrForeignToplevelHandleV1> for State {
     fn event(
         &mut self,
-        event_queue: &mut EventQueue<Self>,
+        conn: &mut Connection<Self>,
         wlr_toplevel: zwlr_foreign_toplevel_handle_v1::ZwlrForeignToplevelHandleV1,
         event: zwlr_foreign_toplevel_handle_v1::Event,
     ) {
@@ -128,7 +123,7 @@ impl Dispatch<zwlr_foreign_toplevel_handle_v1::ZwlrForeignToplevelHandleV1> for 
                     self.new_title = Some(default());
                 }
 
-                wlr_toplevel.destroy(event_queue);
+                wlr_toplevel.destroy(conn);
                 self.toplevels.remove(&wlr_toplevel);
             }
             Event::Done => {
